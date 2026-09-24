@@ -241,6 +241,197 @@ class Board:
         self.buildable_edges_cache = {}  # Reset buildable_edges
         return previous_road_color, self.road_color, self.road_lengths
 
+    # ===== Loading a whole position (catan-player, 2026-09-17)
+    #
+    # build_settlement / build_road grow the board ONE PIECE AT A TIME and
+    # assume the pieces arrive in the order they were built: an opponent's
+    # settlement cuts a road network only if the roads were there first,
+    # a road is refused unless it already connects. A position read off a
+    # PICTURE has no order, and loading it through those two calls was the
+    # root of three workarounds in catan-player (two-pass placement, the
+    # _road_legal filter, roads dropped with a note when a later settlement
+    # cut them). set_position writes every piece straight into the board
+    # and rebuilds the derived state from scratch; validate says what is
+    # wrong with the position instead of raising on the first piece.
+
+    def set_position(self, buildings, roads, robber_coordinate=None,
+                     longest_road_holder=None, longest_road_length=0, holder_known=True):
+        """Load a whole position at once.
+
+        Args:
+            buildings: {node_id: (Color, SETTLEMENT | CITY)}
+            roads: {(a, b): Color} -- either direction; both are stored
+            robber_coordinate: the robber's tile, or None to leave it
+            longest_road_holder: the Color the HUD shows holding Longest
+                Road (None: nobody), and longest_road_length its length as
+                the HUD shows it; the computed length wins when longer
+            holder_known: False when the HUD's badge was NOT read (his ask,
+                2026-09-17 01:00: "the system should explicitly say I don't
+                know who has the longest road" -- None must not mean
+                nobody). Then: one colour alone with the longest road of
+                five or more holds it by the rules (inferred, said);
+                two or more tied could each hold it, or nobody if the tie
+                came from a cut -- the holder stays None, road_candidates
+                lists them, validate() says so.
+        Returns self. Nothing is checked here: call validate() after.
+        """
+        self.buildings = {int(n): (c, b) for n, (c, b) in buildings.items()}
+        self.roads = {}
+        for edge, color in roads.items():
+            a, b = int(edge[0]), int(edge[1])
+            self.roads[(a, b)] = color
+            self.roads[(b, a)] = color
+
+        # buildable nodes: land nodes not built on and not next to a building
+        self.board_buildable_ids = set(self.map.land_nodes)
+        for n in self.buildings:
+            self.board_buildable_ids.discard(n)
+            for m in STATIC_GRAPH.neighbors(n):
+                self.board_buildable_ids.discard(m)
+
+        # each colour's road networks, an opponent's building a dead end
+        self.connected_components = defaultdict(list)
+        colors = {c for c, _ in self.buildings.values()} | set(self.roads.values())
+        for color in colors:
+            self.connected_components[color] = self._components(color)
+
+        # each colour's longest single line, and the award as the HUD shows it
+        self.road_lengths = defaultdict(int)
+        for color in colors:
+            self.road_lengths[color] = max(
+                (len(longest_acyclic_path(self, comp, color)) for comp in self.connected_components[color]),
+                default=0,
+            )
+        longest = max(self.road_lengths.values(), default=0)
+        self.road_holder_known = bool(holder_known) or longest_road_holder is not None
+        self.road_holder_inferred = False
+        self.road_candidates = sorted((c for c, n in self.road_lengths.items() if n == longest and n >= 5),
+                                      key=lambda c: c.value) if longest >= 5 else []
+        self.road_color = longest_road_holder
+        if longest_road_holder is not None:
+            self.road_length = max(int(longest_road_length or 0), self.road_lengths[longest_road_holder])
+        else:
+            self.road_length = longest if longest >= 5 else 0
+            if not self.road_holder_known and len(self.road_candidates) == 1:
+                self.road_color = self.road_candidates[0]        # alone at the top: the rules give it to them
+                self.road_holder_inferred = True
+
+        if robber_coordinate is not None:
+            self.robber_coordinate = robber_coordinate
+        self.buildable_edges_cache = {}
+        self.player_port_resources_cache = {}
+        return self
+
+    def _components(self, color):
+        """The connected pieces of `color`'s network, as build_road keeps
+        them: every building node of the colour and every node its roads
+        reach, walked along the colour's roads, an opponent's building
+        being a dead end (never inside a component). A building with no
+        road is a component of its own."""
+        seeds = {n for n, (c, _) in self.buildings.items() if c == color}
+        for (a, b), c in self.roads.items():
+            if c == color:
+                seeds.update((a, b))
+        seeds = {n for n in seeds if not self.is_enemy_node(n, color)}
+        comps = []
+        left = set(seeds)
+        while left:
+            start = left.pop()
+            comp = {start}
+            agenda = [start]
+            while agenda:
+                n = agenda.pop()
+                for v in STATIC_GRAPH.neighbors(n):
+                    if v in comp or self.roads.get((n, v)) != color or self.is_enemy_node(v, color):
+                        continue
+                    comp.add(v)
+                    agenda.append(v)
+            left -= comp
+            comps.append(comp)
+        return sorted(comps, key=lambda s: min(s))
+
+    def validate(self, expected=None, me=None, stock=(5, 4, 15)):
+        """What is wrong with the loaded position, as findings rather than
+        an exception: [(level, code, text)], level "critical" or "note".
+
+        expected: {Color: {"vp": int, "longest_road": int,
+                   "has_longest_road": bool, "has_largest_army": bool}}
+                  -- the HUD's numbers, each optional
+        me:       the Color asking; its own road island is critical, an
+                  opponent's is a note
+        stock:    settlements, cities, roads per seat
+        """
+        out = []
+        # the distance rule: no two buildings on neighbouring nodes
+        seen = set()
+        for n, (c, b) in sorted(self.buildings.items()):
+            for m in STATIC_GRAPH.neighbors(n):
+                if m in self.buildings and (m, n) not in seen:
+                    seen.add((n, m))
+                    c2, b2 = self.buildings[m]
+                    out.append(("critical", "adjacent",
+                                "%s %s on node %d next to %s %s on node %d: the distance rule forbids it"
+                                % (c.value, b.lower(), n, c2.value, b2.lower(), m)))
+        # pieces against the stock
+        counts = defaultdict(lambda: [0, 0, 0])
+        for n, (c, b) in self.buildings.items():
+            counts[c][0 if b == SETTLEMENT else 1] += 1
+        for (a, b), c in self.roads.items():
+            if a < b:
+                counts[c][2] += 1
+        for c, (s, ci, r) in counts.items():
+            for have, limit, name in ((s, stock[0], "settlements"), (ci, stock[1], "cities"), (r, stock[2], "roads")):
+                if have > limit:
+                    out.append(("critical", "stock", "%s has %d %s on the board and the game gives %d" % (c.value, have, name, limit)))
+        # road islands: a network touching no building of its colour and
+        # ending at no opponent's building (a cut network is not an island)
+        for color, comps in self.connected_components.items():
+            for comp in comps:
+                if any(self.buildings.get(n, (None, None))[0] == color for n in comp):
+                    continue
+                if any(self.roads.get((n, v)) == color and self.is_enemy_node(v, color)
+                       for n in comp for v in STATIC_GRAPH.neighbors(n)):
+                    continue
+                edges = sorted({tuple(sorted((n, v))) for n in comp for v in STATIC_GRAPH.neighbors(n)
+                                if self.roads.get((n, v)) == color})
+                if not edges:
+                    continue
+                out.append(("critical" if color == me else "note", "island",
+                            "%s road(s) %s touch no building of theirs" % (color.value, edges)))
+        # the HUD's numbers against the pieces
+        for color, e in (expected or {}).items():
+            s, ci, _ = counts.get(color, (0, 0, 0))
+            awards = 2 * int(self.road_color == color) + 2 * int(bool(e.get("has_largest_army")))
+            visible = s + 2 * ci + awards
+            vp = e.get("vp")
+            if vp is not None:
+                if int(vp) < visible:
+                    out.append(("critical", "vp", "%s shows %d points on the HUD and %d on the board (%d settlements, %d cities, %d for awards)"
+                                % (color.value, int(vp), visible, s, ci, awards)))
+                elif int(vp) > visible:
+                    out.append(("note", "hidden", "%s: %d point(s) not on the board (Victory Point cards)" % (color.value, int(vp) - visible)))
+            lr = e.get("longest_road")
+            if lr is not None and int(lr) != self.road_lengths.get(color, 0):
+                out.append(("note", "road_length", "%s: the HUD says longest road %d, the pieces give %d"
+                            % (color.value, int(lr), self.road_lengths.get(color, 0))))
+        # the Longest Road holder: known, inferred, or unknown with the candidates
+        cands = [c.value for c in getattr(self, "road_candidates", [])]
+        if not getattr(self, "road_holder_known", True):
+            if getattr(self, "road_holder_inferred", False):
+                out.append(("note", "holder", "the HUD's Longest Road badge was not read: %s holds it by the rules "
+                                              "(alone with a road of %d)" % (self.road_color.value, self.road_length)))
+            elif len(cands) >= 2:
+                # his call, 2026-09-17 01:15: "unknown tie is a stop"
+                out.append(("critical", "holder", "the HUD's Longest Road badge was not read and %s each have a road of %d: "
+                                                  "the holder is UNKNOWN -- one of them, or nobody if the tie came from a cut"
+                                                  % (" and ".join(cands), self.road_length)))
+        elif self.road_color is None and self.road_lengths:
+            longest_color, longest = max(self.road_lengths.items(), key=lambda kv: kv[1])
+            if longest >= 5:
+                out.append(("note", "holder", "%s has a road of %d and the HUD shows no Longest Road holder"
+                            % (longest_color.value, longest)))
+        return out
+
     def build_city(self, color, node_id):
         building = self.buildings.get(node_id, None)
         if building is None or building[0] != color or building[1] != SETTLEMENT:
