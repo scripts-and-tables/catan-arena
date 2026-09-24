@@ -73,6 +73,12 @@ class Board:
             self.road_lengths = defaultdict(int)
             self.road_color = None
             self.road_length = 0
+            # set_position: whether the holder above is KNOWN (the HUD's
+            # badge read), inferred from the lengths, or unknown; and the
+            # colours that could hold it when it is unknown (catan-player)
+            self.road_holder_known = True
+            self.road_holder_inferred = False
+            self.road_candidates = []
 
             # assumes there is at least one desert:
             self.robber_coordinate = filter(
@@ -313,6 +319,9 @@ class Board:
         board.road_lengths = self.road_lengths.copy()
         board.road_color = self.road_color
         board.road_length = self.road_length
+        board.road_holder_known = getattr(self, "road_holder_known", True)
+        board.road_holder_inferred = getattr(self, "road_holder_inferred", False)
+        board.road_candidates = list(getattr(self, "road_candidates", []))
 
         board.robber_coordinate = self.robber_coordinate
         board.buildable_subgraph = self.buildable_subgraph
