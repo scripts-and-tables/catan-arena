@@ -353,8 +353,24 @@ class Board:
 
 
 def longest_acyclic_path(board: Board, node_set: Set[int], color: Color):
+    # catan-player, 2026-09-17: the counting fix of upstream PR #384 (broussal,
+    # 2026-08-08, open) -- a road ending AT an opponent's building counts;
+    # the route simply stops there. Upstream skipped the edge into an enemy
+    # node, so every line ending at an opponent's settlement was one short
+    # (the HUD showed one more than the engine on 30 of 99 recorded turns).
+    # Two conditions are lifted: a route may FINISH on an enemy node, and
+    # may START from one. `node_set` omits enemy nodes (never added by
+    # build_road / set_position), so they would otherwise be unreachable as
+    # DFS roots; a route has one start and one end, so two blocked
+    # extremities consume one condition each.
+    start_nodes = set(node_set)
+    for node in node_set:
+        for neighbor_node in STATIC_GRAPH.neighbors(node):
+            if board.is_friendly_road(tuple(sorted((node, neighbor_node))), color):
+                start_nodes.add(neighbor_node)
+
     paths = []
-    for start_node in node_set:
+    for start_node in start_nodes:
         # do DFS when reach leaf node, stop and add to paths
         paths_from_this_node = []
         agenda: List[Tuple[int, Any]] = [(start_node, [])]
@@ -369,17 +385,22 @@ def longest_acyclic_path(board: Board, node_set: Set[int], color: Color):
                 if not board.is_friendly_road(edge, color):
                     continue
 
-                # Can't expand past an enemy node.
-                if board.is_enemy_node(neighbor_node, color):
+                if edge in path_thus_far:
                     continue
 
-                if edge not in path_thus_far:
-                    agenda.append((neighbor_node, path_thus_far + [edge]))
-                    able_to_navigate = True
+                # Can't expand past an enemy node -- that would be two
+                # consecutive segments meeting on it -- but the road leading
+                # to it counts.
+                if board.is_enemy_node(neighbor_node, color):
+                    paths_from_this_node.append(path_thus_far + [edge])
+                    continue
+
+                agenda.append((neighbor_node, path_thus_far + [edge]))
+                able_to_navigate = True
 
             if not able_to_navigate:  # then it is leaf node
                 paths_from_this_node.append(path_thus_far)
 
         paths.extend(paths_from_this_node)
 
-    return max(paths, key=len)
+    return max(paths, key=len) if paths else []
