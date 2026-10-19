@@ -139,3 +139,5 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
+# The arena's register and run files: local only, never pushed (the repo is public).
+arena-data/

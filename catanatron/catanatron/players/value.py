@@ -132,9 +132,11 @@ def value_production(sample, player_name="P0", include_variety=True):
         f"EFFECTIVE_{player_name}_WOOD_PRODUCTION",
         f"EFFECTIVE_{player_name}_BRICK_PRODUCTION",
     ]
-    prod_sum = sum([sample[f] for f in features])
+    # A SOLO game has no P1, and the sample then has no P1 features at all --
+    # read them as 0 rather than raise (catan-player, 2026-09-25).
+    prod_sum = sum([sample.get(f, 0) for f in features])
     prod_variety = (
-        sum([sample[f] != 0 for f in features]) * TRANSLATE_VARIETY * proba_point
+        sum([sample.get(f, 0) != 0 for f in features]) * TRANSLATE_VARIETY * proba_point
     )
     return prod_sum + (0 if not include_variety else prod_variety)
 
