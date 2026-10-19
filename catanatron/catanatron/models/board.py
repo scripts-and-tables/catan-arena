@@ -115,44 +115,35 @@ class Board:
         previous_road_color = self.road_color
         if initial_build_phase:
             self.connected_components[color].append({node_id})
-        else:
-            # Maybe cut connected components.
-            edges_by_color = defaultdict(list)
-            for edge in STATIC_GRAPH.edges(node_id):
-                edges_by_color[self.roads.get(edge, None)].append(edge)
+        # Maybe cut connected components. In the setup phase too: a second
+        # settlement may sit on the far end of an opponent's first road, and
+        # skipping it left that settlement inside the opponent's network.
+        edges_by_color = defaultdict(list)
+        for edge in STATIC_GRAPH.edges(node_id):
+            edges_by_color[self.roads.get(edge, None)].append(edge)
 
-            for edge_color, edges in edges_by_color.items():
-                if edge_color == color or edge_color is None:
-                    continue  # ignore
-                if len(edges) == 2:  # rip, edge_color has been plowed
-                    # consider cut was at b=node_id for edges (a, b) and (b, c)
-                    a = [n for n in edges[0] if n != node_id].pop()
-                    c = [n for n in edges[1] if n != node_id].pop()
-
-                    # do dfs from a adding all encountered nodes
-                    a_nodeset = self.dfs_walk(a, edge_color)
-                    c_nodeset = self.dfs_walk(c, edge_color)
-
-                    # split this components on here.
-                    b_index = self._get_connected_component_index(node_id, edge_color)
-                    del self.connected_components[edge_color][b_index]
-                    self.connected_components[edge_color].append(a_nodeset)
-                    if c_nodeset != a_nodeset:
-                        # On a loop, cutting one node disconnects nothing and both
-                        # walks come back identical: there is no second component.
-                        self.connected_components[edge_color].append(c_nodeset)
-
-                    # Update longest road by plowed player. Compare again with all
-                    self.road_lengths[edge_color] = max(
-                        len(longest_acyclic_path(self, component, edge_color))
-                        for component in self.connected_components[edge_color]
-                    )
-                    self._resolve_road_holder()
-                elif len(edges) == 1:
-                    # Endpoint blocked: remove node_id from opponent's component
-                    b_index = self._get_connected_component_index(node_id, edge_color)
-                    if b_index is not None:
-                        self.connected_components[edge_color][b_index].discard(node_id)
+        for edge_color, edges in edges_by_color.items():
+            if edge_color == color or edge_color is None:
+                continue  # ignore
+            # catan-arena, 2026-10-19 (upstream #391, the approach of
+            # closed PR #393): the settlement touches edge_color's roads,
+            # so rebuild that network from the board, the new building
+            # being a dead end. The old in-place patch split the network
+            # with dfs_walk, which KEEPS an enemy stop node: after a cut,
+            # a road could be built out of an opponent's settlement, and
+            # a node could fall out of every component, so a later cut
+            # raised TypeError (del list[None]).
+            self.connected_components[edge_color] = self._components(edge_color)
+            if len(edges) == 2:  # rip, edge_color has been plowed
+                # Update longest road by plowed player. Compare again with all
+                self.road_lengths[edge_color] = max(
+                    (len(longest_acyclic_path(self, component, edge_color))
+                     for component in self.connected_components[edge_color]),
+                    default=0,
+                )
+                self._resolve_road_holder()
+            # One edge: the road now ENDS at this settlement. Its length
+            # is unchanged (the road leading into a building counts).
 
         self.board_buildable_ids.discard(node_id)
         for n in STATIC_GRAPH.neighbors(node_id):

@@ -357,3 +357,104 @@ def test_many_buildings():
 
 
 # TODO: Test super long road, cut at many places, to yield 5+ component graph
+
+
+# ===== A settlement on an opponent's road (upstream #391, #393; catan-arena 2026-10-19)
+
+
+def _red_road_ending_at_orange_then_cut():
+    """RED's road runs 10-11-12-3-4-5-0 into ORANGE's settlement at 0; BLUE cuts it at 12."""
+    board = Board()
+    board.build_settlement(Color.ORANGE, 0, True)
+    board.build_road(Color.ORANGE, (0, 1))
+    board.build_settlement(Color.RED, 10, True)
+    for edge in ((10, 11), (11, 12), (12, 3), (3, 4), (4, 5), (5, 0)):
+        board.build_road(Color.RED, edge)
+    board.build_settlement(Color.BLUE, 14, True)
+    board.build_road(Color.BLUE, (14, 13))
+    board.build_road(Color.BLUE, (13, 12))
+    board.build_settlement(Color.BLUE, 12)  # the cut
+    return board
+
+
+def test_a_cut_does_not_open_a_road_out_of_an_opponents_settlement():
+    board = _red_road_ending_at_orange_then_cut()
+    assert not any(0 in edge for edge in board.buildable_edges(Color.RED))
+    with pytest.raises(ValueError):
+        board.build_road(Color.RED, (0, 20))
+    assert sorted(map(sorted, board.connected_components[Color.RED])) == [[3, 4, 5], [10, 11]]
+    assert board.road_lengths[Color.RED] == 4  # 12-3-4-5-0: both ends at buildings still count
+
+
+def test_more_cuts_after_the_first_do_not_crash():
+    # Upstream #391: the old split left nodes in no component and a later cut
+    # raised TypeError. Same board, then WHITE cuts at 4 and BLUE settles past it.
+    board = _red_road_ending_at_orange_then_cut()
+    board.build_settlement(Color.WHITE, 17, True)
+    board.build_road(Color.WHITE, (17, 15))
+    board.build_road(Color.WHITE, (15, 4))
+    board.build_settlement(Color.WHITE, 4)
+    assert sorted(map(sorted, board.connected_components[Color.RED])) == [[3], [5], [10, 11]]
+    assert board.road_lengths[Color.RED] == 2
+
+
+def test_a_settlement_on_the_end_of_a_road_blocks_it_and_a_later_cut_keeps_the_rest():
+    # Upstream PR #393's example.
+    board = Board()
+    board.build_settlement(Color.ORANGE, 18, initial_build_phase=True)
+    board.build_settlement(Color.WHITE, 22, initial_build_phase=True)
+    board.build_settlement(Color.BLUE, 15, initial_build_phase=True)
+    for edge in [(16, 18), (5, 16), (0, 5), (0, 1), (1, 6)]:
+        board.build_road(Color.ORANGE, edge)  # ORANGE's road ends at node 6
+    board.build_road(Color.WHITE, (22, 23))
+    board.build_road(Color.WHITE, (6, 23))
+    board.build_settlement(Color.WHITE, 6)  # WHITE settles on the end of it
+
+    with pytest.raises(ValueError):
+        board.build_road(Color.ORANGE, (6, 7))  # out of WHITE's settlement
+    assert board.road_lengths[Color.ORANGE] == 5
+
+    board.build_road(Color.BLUE, (4, 15))
+    board.build_road(Color.BLUE, (4, 5))
+    board.build_settlement(Color.BLUE, 5)  # cuts ORANGE in the middle
+    assert sorted(map(sorted, board.connected_components[Color.ORANGE])) == [[0, 1], [16, 18]]
+    assert board.road_lengths[Color.ORANGE] == 3  # 5-0-1-6, from one building to the other
+
+
+def test_a_setup_settlement_on_the_end_of_an_opponents_first_road_blocks_it():
+    # Seen in a random game (seed 43): BLUE's second settlement sat on the end
+    # of ORANGE's first road; the setup phase never updated ORANGE's network,
+    # and ORANGE later built a road out of BLUE's settlement.
+    board = Board()
+    board.build_settlement(Color.ORANGE, 0, initial_build_phase=True)
+    board.build_road(Color.ORANGE, (0, 1))
+    board.build_road(Color.ORANGE, (1, 6))  # stands in for a later road; 6 is two steps from 0
+    board.build_settlement(Color.BLUE, 6, initial_build_phase=True)
+    assert sorted(map(sorted, board.connected_components[Color.ORANGE])) == [[0, 1]]
+    assert not any(6 in edge for edge in board.buildable_edges(Color.ORANGE))
+    with pytest.raises(ValueError):
+        board.build_road(Color.ORANGE, (6, 7))
+
+
+def test_road_networks_match_a_rebuild_from_scratch_in_random_games():
+    """After every move, each colour's network as kept move by move equals the
+    one rebuilt from the board, and never contains an opponent's building."""
+    from catanatron.game import Game
+    from catanatron.models.player import RandomPlayer
+
+    colors = [Color.RED, Color.BLUE, Color.WHITE, Color.ORANGE]
+    cuts = 0
+    for seed in range(40):
+        game = Game([RandomPlayer(c) for c in colors], seed=seed)
+        while game.winning_color() is None and game.state.num_turns < 1000:
+            action = game.play_tick().action
+            board = game.state.board
+            for color in colors:
+                kept = {frozenset(c) for c in board.connected_components[color]}
+                assert kept == {frozenset(c) for c in board._components(color)}, (seed, action)
+                assert not any(board.is_enemy_node(n, color) for c in kept for n in c), (seed, action)
+            if action.action_type.name == "BUILD_SETTLEMENT" and any(
+                board.roads.get(e) not in (None, action.color) for e in board.buildable_subgraph.edges(action.value)
+            ):
+                cuts += 1
+    assert cuts > 0  # the games did put settlements on opponents' roads
