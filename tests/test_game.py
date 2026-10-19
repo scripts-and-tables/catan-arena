@@ -680,3 +680,18 @@ def test_seeded_games_are_isolated_from_each_other():
 
     assert [str(a) for a in game_a.state.action_records] == solo_a
     assert [str(a) for a in game_b.state.action_records] == solo_b
+
+
+def test_longest_road_length_is_synced_after_initial_placement():
+    """player_state must match the board once the initial placement is over."""
+    players = [SimplePlayer(Color.RED), SimplePlayer(Color.BLUE)]
+    game = Game(players)
+    while game.state.is_initial_build_phase:
+        game.play_tick()
+
+    for player in players:
+        key = player_key(game.state, player.color)
+        assert (
+            game.state.player_state[f"{key}_LONGEST_ROAD_LENGTH"]
+            == game.state.board.road_lengths[player.color]
+        )
